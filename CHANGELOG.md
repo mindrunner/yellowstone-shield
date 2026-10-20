@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Policy store: `rpc` and `grpc` cargo features (`grpc` is the default and enables `rpc`). With `default-features = false` the crate only contains `PolicyCache`, `Snapshot`, `PolicyStore` and the mocks, without solana-client, yellowstone-grpc or tokio
+
 ### Changed
 
 - `PolicyStoreRpcConfig` has a new `resync_interval` field

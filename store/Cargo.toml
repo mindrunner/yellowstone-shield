@@ -8,31 +8,52 @@ description = "Policy store for the Yellowstone Shield program"
 repository = "https://github.com/rpcpool/yellowstone-shield"
 license = "Apache-2.0"
 
+[features]
+default = ["grpc"]
+# `PolicyRpcClient` to list all policies over RPC.
+rpc = [
+  "dep:solana-account",
+  "dep:solana-account-decoder-client-types",
+  "dep:solana-client",
+  "dep:solana-commitment-config",
+]
+# `PolicyStore::build()`, which keeps the store in sync over RPC and gRPC.
+grpc = [
+  "rpc",
+  "dep:futures",
+  "dep:humantime-serde",
+  "dep:serde",
+  "dep:tokio",
+  "dep:yellowstone-grpc-client",
+  "dep:yellowstone-grpc-proto",
+]
+
 [dependencies]
 anyhow = { workspace = true }
 arc-swap = { workspace = true }
 borsh = { workspace = true, features = ["derive"] }
-futures = { workspace = true }
+futures = { workspace = true, optional = true }
 hashbrown = { workspace = true }
-humantime-serde = { workspace = true }
+humantime-serde = { workspace = true, optional = true }
 log = { workspace = true }
 parking_lot = { workspace = true }
-serde = { workspace = true, features = ["derive"] }
+serde = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
+tokio = { workspace = true, features = ["full"], optional = true }
 # Agave Monorepo
-solana-account-decoder-client-types = { workspace = true }
-solana-client = { workspace = true }
+solana-account-decoder-client-types = { workspace = true, optional = true }
+solana-client = { workspace = true, optional = true }
 # Solana SDK
-solana-account = { workspace = true }
-solana-commitment-config = { workspace = true }
+solana-account = { workspace = true, optional = true }
+solana-commitment-config = { workspace = true, optional = true }
 solana-pubkey = { workspace = true }
 # Yellowstone
-yellowstone-grpc-client = { workspace = true }
-yellowstone-grpc-proto = { workspace = true }
+yellowstone-grpc-client = { workspace = true, optional = true }
+yellowstone-grpc-proto = { workspace = true, optional = true }
 yellowstone-shield-parser = { workspace = true }
 
 [dev-dependencies]
+futures = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 solana-cli-config = { workspace = true }
@@ -41,3 +62,7 @@ toml = { workspace = true }
 yellowstone-grpc-client = { workspace = true, features = ["test-tools"] }
 yellowstone-shield-cli = { workspace = true }
 yellowstone-shield-client = { workspace = true }
+
+[[example]]
+name = "complete"
+required-features = ["grpc"]
