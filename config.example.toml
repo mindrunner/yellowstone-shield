@@ -2,6 +2,9 @@
 # Solana RPC endpoint for initial policy fetching
 endpoint = "http://127.0.0.1:8899"
 
+# How often all policies are re-fetched to drop closed ones (optional, defaults to 5m)
+# resync_interval = "5m"
+
 [grpc]
 # Yellowstone gRPC endpoint for real-time policy updates
 endpoint = "http://127.0.0.1:10000"

@@ -9,10 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- `PolicyStoreRpcConfig` has a new `resync_interval` field
 - Bump yellowstone-grpc-client to v15.0 and yellowstone-grpc-proto to v14.0
 
 ### Fixed
 
+- Policy store: closed policies are now removed from the cache. The store also subscribes to the known policy addresses (closing a policy assigns it to the system program, so the owner filter never sees it) and re-fetches all policies over RPC every `rpc.resync_interval` (default 5m) (#24)
 - Policy store: return a `StoreError` instead of panicking when the gRPC TLS config can't be applied
 
 ## 0.7.0

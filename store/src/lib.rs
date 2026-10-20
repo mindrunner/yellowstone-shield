@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use hashbrown::{HashMap, HashSet};
 use parking_lot::RwLock;
 use serde::Deserialize;
@@ -19,7 +19,7 @@ use std::time::Duration;
 use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
-    SubscribeRequestFilterAccounts,
+    SubscribeRequestFilterAccounts, SubscribeUpdateAccount,
 };
 use yellowstone_shield_parser::accounts::{
     parse_account, PermissionStrategy, Policy, ShieldProgramState, ID as PROGRAM_ID,
@@ -102,6 +102,45 @@ impl PolicyCache {
     /// `Some(())` if a policy was removed, or `None` if no policy was associated with the given public key.
     pub fn remove(&self, pubkey: &Pubkey) -> Option<()> {
         self.policies.write().remove(pubkey).map(|_| ())
+    }
+
+    /// Removes a policy that was closed at the given slot.
+    /// Only removes if the slot is not older than the cached policy.
+    ///
+    /// # Returns
+    ///
+    /// `true` if a policy was removed.
+    pub fn remove_at(&self, pubkey: &Pubkey, slot: u64) -> bool {
+        let mut policies = self.policies.write();
+        match policies.get(pubkey) {
+            Some(current_item) if slot >= current_item.slot => {
+                policies.remove(pubkey);
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Synchronizes the cache with a full listing of the program accounts.
+    ///
+    /// Policies from the response are inserted with the usual slot check. Cached policies that
+    /// are missing from the response were closed and get removed, unless they were updated
+    /// after the response slot.
+    pub fn sync(&self, response: PoliciesSlotRpcResponse) {
+        let listed: HashSet<Pubkey> = response.result.iter().map(|(k, _)| *k).collect();
+
+        self.policies
+            .write()
+            .retain(|k, item| listed.contains(k) || item.slot > response.slot);
+
+        for (address, policy) in response.result.into_iter() {
+            self.insert(address, response.slot, policy);
+        }
+    }
+
+    /// Retrieves the addresses of all policies currently stored in the cache.
+    pub fn addresses(&self) -> HashSet<Pubkey> {
+        self.policies.read().keys().copied().collect()
     }
 
     /// Retrieves all policies currently stored in the cache.
@@ -355,6 +394,15 @@ pub type SubscriptionTask = std::pin::Pin<Box<dyn std::future::Future<Output = (
 #[derive(Deserialize, Clone)]
 pub struct PolicyStoreRpcConfig {
     pub endpoint: String,
+
+    /// How often all policies are re-fetched over RPC. Closed policies are not always visible
+    /// on the gRPC stream, so this is the fallback that removes them from the cache.
+    #[serde(with = "humantime_serde", default = "default_resync_interval")]
+    pub resync_interval: Duration,
+}
+
+fn default_resync_interval() -> Duration {
+    Duration::from_secs(300)
 }
 
 #[derive(Deserialize, Clone)]
@@ -504,14 +552,14 @@ impl PolicyStoreBuilder {
 
     pub async fn run(&mut self) -> StoreResult<PolicyStore> {
         let config = self.config.take().ok_or(StoreError::NoConfig)?;
-        let rpc = RpcClient::new(config.rpc.endpoint);
+        let rpc = PolicyRpcClient::new(RpcClient::new(config.rpc.endpoint.clone()));
 
-        let policies = PolicyRpcClient::new(rpc)
+        let policies = rpc
             .list(&PROGRAM_ID)
             .await
             .map_err(|e| StoreError::RpcError(e.to_string()))?;
 
-        let cache = Arc::new(policies.into());
+        let cache: Arc<PolicyCache> = Arc::new(policies.into());
         let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::new(&cache)));
 
         // Build gRPC client with configuration
@@ -576,26 +624,10 @@ impl PolicyStoreBuilder {
 
         log::info!("Connected to gRPC endpoint: {}", config.grpc.endpoint);
 
-        // Subscribe to account updates for the Shield program
-        let mut accounts = std::collections::HashMap::new();
-        accounts.insert(
-            "".to_string(),
-            SubscribeRequestFilterAccounts {
-                account: vec![],
-                owner: vec![PROGRAM_ID.to_string()],
-                filters: vec![],
-                nonempty_txn_signature: None,
-                cuckoo_accounts_filter: None,
-            },
-        );
+        let mut subscribed = cache.addresses();
 
-        let subscribe_request = SubscribeRequest {
-            accounts,
-            ..Default::default()
-        };
-
-        let mut stream = client
-            .subscribe_once(subscribe_request)
+        let (mut sink, mut stream) = client
+            .subscribe_with_request(Some(subscribe_request(&subscribed)))
             .await
             .map_err(|e| {
                 StoreError::GrpcSubscriptionError(format!(
@@ -609,56 +641,57 @@ impl PolicyStoreBuilder {
         // Spawn task to process account updates
         let cache_clone = Arc::clone(&cache);
         let snapshot_clone = Arc::clone(&snapshot);
+        let resync_interval = config.rpc.resync_interval;
 
         tokio::spawn(async move {
-            while let Some(message) = stream.next().await {
-                match message {
-                    Ok(msg) => {
-                        if let Some(UpdateOneof::Account(account_update)) = msg.update_oneof {
-                            // Parse account data
-                            if let Some(account) = account_update.account {
-                                let pubkey_bytes: [u8; 32] = match account.pubkey.try_into() {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => {
-                                        log::warn!("Invalid pubkey length in account update");
-                                        continue;
-                                    }
-                                };
-                                let pubkey = Pubkey::from(pubkey_bytes);
+            let mut resync = tokio::time::interval_at(
+                tokio::time::Instant::now() + resync_interval,
+                resync_interval,
+            );
+            resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-                                let owner_bytes: [u8; 32] = match account.owner.try_into() {
-                                    Ok(bytes) => bytes,
-                                    Err(_) => {
-                                        log::warn!("Invalid owner length in account update");
-                                        continue;
-                                    }
-                                };
-                                let owner = Pubkey::from(owner_bytes);
-
-                                // Parse the account
-                                match parse_account(
-                                    account_update.slot,
-                                    pubkey,
-                                    &owner,
-                                    &account.data,
-                                    Some(&PROGRAM_ID),
-                                ) {
-                                    Ok(ShieldProgramState::Policy(slot, pubkey, policy)) => {
-                                        cache_clone.insert(pubkey, slot, policy);
-                                        snapshot_clone.store(Arc::new(Snapshot::new(&cache_clone)));
-                                        log::debug!("Updated policy for pubkey: {}", pubkey);
-                                    }
-                                    Err(e) => {
-                                        log::warn!("Failed to parse account update: {}", e);
-                                    }
-                                }
+            loop {
+                let changed = tokio::select! {
+                    message = stream.next() => match message {
+                        Some(Ok(msg)) => match msg.update_oneof {
+                            Some(UpdateOneof::Account(account_update)) => {
+                                apply_account_update(&cache_clone, account_update)
                             }
+                            _ => false,
+                        },
+                        Some(Err(e)) => {
+                            log::error!("Error receiving gRPC message: {}", e);
+                            break;
                         }
-                    }
-                    Err(e) => {
-                        log::error!("Error receiving gRPC message: {}", e);
+                        None => break,
+                    },
+                    _ = resync.tick() => match rpc.list(&PROGRAM_ID).await {
+                        Ok(policies) => {
+                            cache_clone.sync(policies);
+                            true
+                        }
+                        Err(e) => {
+                            log::warn!("Failed to resync policies over RPC: {}", e);
+                            false
+                        }
+                    },
+                };
+
+                if !changed {
+                    continue;
+                }
+
+                snapshot_clone.store(Arc::new(Snapshot::new(&cache_clone)));
+
+                // Closing a policy assigns it to the system program, so the owner filter never
+                // sees the close. Subscribing to the known addresses as well catches it.
+                let addresses = cache_clone.addresses();
+                if addresses != subscribed {
+                    if let Err(e) = sink.send(subscribe_request(&addresses)).await {
+                        log::error!("Failed to update gRPC subscription: {}", e);
                         break;
                     }
+                    subscribed = addresses;
                 }
             }
 
@@ -666,6 +699,94 @@ impl PolicyStoreBuilder {
         });
 
         Ok(PolicyStore::new(snapshot))
+    }
+}
+
+const OWNER_FILTER: &str = "shield-policies-by-owner";
+const ADDRESS_FILTER: &str = "shield-policies-by-address";
+
+/// Builds the subscription for all Shield program accounts plus the given policy addresses.
+fn subscribe_request(addresses: &HashSet<Pubkey>) -> SubscribeRequest {
+    let mut accounts = std::collections::HashMap::new();
+    accounts.insert(
+        OWNER_FILTER.to_string(),
+        SubscribeRequestFilterAccounts {
+            owner: vec![PROGRAM_ID.to_string()],
+            ..Default::default()
+        },
+    );
+
+    // An account filter without addresses or owners matches every account, so only add it when
+    // there is something to watch.
+    if !addresses.is_empty() {
+        accounts.insert(
+            ADDRESS_FILTER.to_string(),
+            SubscribeRequestFilterAccounts {
+                account: addresses.iter().map(|a| a.to_string()).collect(),
+                ..Default::default()
+            },
+        );
+    }
+
+    SubscribeRequest {
+        accounts,
+        ..Default::default()
+    }
+}
+
+/// Applies a single account update to the cache.
+///
+/// An account that is no longer owned by the Shield program, has no lamports or no data was
+/// closed and is removed from the cache.
+///
+/// # Returns
+///
+/// `true` if the cache changed.
+fn apply_account_update(cache: &PolicyCache, account_update: SubscribeUpdateAccount) -> bool {
+    let Some(account) = account_update.account else {
+        return false;
+    };
+
+    let pubkey = match <[u8; 32]>::try_from(account.pubkey) {
+        Ok(bytes) => Pubkey::from(bytes),
+        Err(_) => {
+            log::warn!("Invalid pubkey length in account update");
+            return false;
+        }
+    };
+
+    let owner = match <[u8; 32]>::try_from(account.owner) {
+        Ok(bytes) => Pubkey::from(bytes),
+        Err(_) => {
+            log::warn!("Invalid owner length in account update");
+            return false;
+        }
+    };
+
+    if owner != PROGRAM_ID || account.lamports == 0 || account.data.is_empty() {
+        let removed = cache.remove_at(&pubkey, account_update.slot);
+        if removed {
+            log::debug!("Removed closed policy: {}", pubkey);
+        }
+        return removed;
+    }
+
+    match parse_account(
+        account_update.slot,
+        pubkey,
+        &owner,
+        &account.data,
+        Some(&PROGRAM_ID),
+    ) {
+        Ok(ShieldProgramState::Policy(slot, pubkey, policy)) => {
+            cache.insert(pubkey, slot, policy);
+            log::debug!("Updated policy for pubkey: {}", pubkey);
+            true
+        }
+        Err(e) => {
+            log::warn!("Failed to parse account update: {}", e);
+            false
+        }
     }
 }
 
@@ -789,6 +910,170 @@ mod tests {
         assert_eq!(snapshot.is_allowed(&[deny, allow], &other), Ok(false));
         assert_eq!(snapshot.is_allowed(&[deny, allow], &good), Ok(true));
         assert_eq!(snapshot.is_allowed(&[deny, allow], &sandwich), Ok(false));
+    }
+
+    fn policy_v2_data(strategy: PermissionStrategy, identities: &[Pubkey]) -> Vec<u8> {
+        let mut data = vec![1u8, strategy as u8, 255];
+        data.extend_from_slice(Pubkey::new_unique().as_ref());
+        data.extend_from_slice(&(identities.len() as u32).to_le_bytes());
+        for identity in identities {
+            data.extend_from_slice(identity.as_ref());
+        }
+        data
+    }
+
+    fn account_update(
+        pubkey: Pubkey,
+        owner: Pubkey,
+        slot: u64,
+        lamports: u64,
+        data: Vec<u8>,
+    ) -> SubscribeUpdateAccount {
+        SubscribeUpdateAccount {
+            account: Some(yellowstone_grpc_proto::geyser::SubscribeUpdateAccountInfo {
+                pubkey: pubkey.to_bytes().to_vec(),
+                owner: owner.to_bytes().to_vec(),
+                lamports,
+                data,
+                ..Default::default()
+            }),
+            slot,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_policy_cache_remove_at_respects_slot() {
+        let cache = PolicyCache::new();
+        let address = Pubkey::new_unique();
+        let policy = Policy::new(PermissionStrategy::Deny, vec![Pubkey::new_unique()]);
+
+        cache.insert(address, 10, policy);
+
+        assert!(!cache.remove_at(&address, 9));
+        assert!(cache.get(&address).is_some());
+
+        assert!(cache.remove_at(&address, 10));
+        assert!(cache.get(&address).is_none());
+
+        assert!(!cache.remove_at(&address, 11));
+    }
+
+    #[test]
+    fn test_policy_cache_sync_removes_missing_policies() {
+        let cache = PolicyCache::new();
+        let kept = Pubkey::new_unique();
+        let closed = Pubkey::new_unique();
+        let newer = Pubkey::new_unique();
+        let created = Pubkey::new_unique();
+        let policy = Policy::new(PermissionStrategy::Deny, vec![Pubkey::new_unique()]);
+
+        cache.insert(kept, 5, policy.clone());
+        cache.insert(closed, 5, policy.clone());
+        // Updated on the stream after the RPC listing was taken.
+        cache.insert(newer, 20, policy.clone());
+
+        cache.sync(PoliciesSlotRpcResponse {
+            slot: 10,
+            result: vec![(kept, policy.clone()), (created, policy)],
+        });
+
+        assert!(cache.get(&kept).is_some());
+        assert!(cache.get(&created).is_some());
+        assert!(cache.get(&newer).is_some());
+        assert!(cache.get(&closed).is_none());
+    }
+
+    #[test]
+    fn test_apply_account_update_inserts_policy() {
+        let cache = PolicyCache::new();
+        let address = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+
+        let update = account_update(
+            address,
+            PROGRAM_ID,
+            1,
+            1_000_000,
+            policy_v2_data(PermissionStrategy::Deny, &[validator]),
+        );
+
+        assert!(apply_account_update(&cache, update));
+
+        let snapshot = Snapshot::new(&cache);
+        assert_eq!(snapshot.is_allowed(&[address], &validator), Ok(false));
+    }
+
+    #[test]
+    fn test_apply_account_update_removes_closed_policy() {
+        let system_program = Pubkey::default();
+        let validator = Pubkey::new_unique();
+
+        let closed_updates = [
+            // What the program does on close: no lamports, no data, owned by the system program.
+            (system_program, 0, vec![]),
+            (
+                system_program,
+                1_000_000,
+                policy_v2_data(PermissionStrategy::Deny, &[validator]),
+            ),
+            (PROGRAM_ID, 0, vec![]),
+            (PROGRAM_ID, 1_000_000, vec![]),
+        ];
+
+        for (owner, lamports, data) in closed_updates {
+            let cache = PolicyCache::new();
+            let address = Pubkey::new_unique();
+            cache.insert(
+                address,
+                1,
+                Policy::new(PermissionStrategy::Deny, vec![validator]),
+            );
+
+            let update = account_update(address, owner, 2, lamports, data);
+
+            assert!(apply_account_update(&cache, update));
+            assert!(cache.get(&address).is_none());
+            assert_eq!(
+                Snapshot::new(&cache).is_allowed(&[address], &validator),
+                Err(CheckError::PolicyNotFound)
+            );
+        }
+    }
+
+    #[test]
+    fn test_apply_account_update_ignores_stale_close() {
+        let cache = PolicyCache::new();
+        let address = Pubkey::new_unique();
+        cache.insert(
+            address,
+            5,
+            Policy::new(PermissionStrategy::Deny, vec![Pubkey::new_unique()]),
+        );
+
+        let update = account_update(address, Pubkey::default(), 4, 0, vec![]);
+
+        assert!(!apply_account_update(&cache, update));
+        assert!(cache.get(&address).is_some());
+    }
+
+    #[test]
+    fn test_subscribe_request_filters() {
+        let request = subscribe_request(&HashSet::new());
+        assert_eq!(request.accounts.len(), 1);
+        assert_eq!(
+            request.accounts[OWNER_FILTER].owner,
+            vec![PROGRAM_ID.to_string()]
+        );
+
+        let address = Pubkey::new_unique();
+        let request = subscribe_request(&HashSet::from([address]));
+        assert_eq!(request.accounts.len(), 2);
+        assert_eq!(
+            request.accounts[ADDRESS_FILTER].account,
+            vec![address.to_string()]
+        );
+        assert!(request.accounts[ADDRESS_FILTER].owner.is_empty());
     }
 
     #[test]
