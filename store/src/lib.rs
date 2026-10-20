@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use anyhow::Result;
 use arc_swap::ArcSwap;
@@ -16,7 +16,9 @@ use solana_client::{
 use solana_commitment_config::CommitmentConfig;
 use solana_pubkey::Pubkey;
 use std::time::Duration;
-use yellowstone_grpc_client::{ClientTlsConfig, GeyserGrpcClient};
+use yellowstone_grpc_client::{
+    ClientTlsConfig, GeyserGrpcClient, GeyserStream, SubscribeRequestSink,
+};
 use yellowstone_grpc_proto::geyser::{
     subscribe_update::UpdateOneof, CommitmentLevel, SubscribeRequest,
     SubscribeRequestFilterAccounts, SubscribeUpdateAccount,
@@ -562,143 +564,241 @@ impl PolicyStoreBuilder {
         let cache: Arc<PolicyCache> = Arc::new(policies.into());
         let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::new(&cache)));
 
-        // Build gRPC client with configuration
-        let mut builder = GeyserGrpcClient::build_from_shared(config.grpc.endpoint.clone())
-            .map_err(|e| {
-                StoreError::GrpcClientError(format!("Failed to build gRPC client: {}", e))
-            })?
-            .connect_timeout(config.grpc.connect_timeout)
-            .timeout(config.grpc.timeout);
-
-        if config.grpc.tcp_nodelay {
-            builder = builder.tcp_nodelay(true);
-        }
-
-        if config.grpc.http2_adaptive_window {
-            builder = builder.http2_adaptive_window(true);
-        }
-
-        builder = builder
-            .tls_config(ClientTlsConfig::new().with_native_roots())
-            .map_err(|e| StoreError::GrpcClientError(format!("Failed to set TLS config: {}", e)))?;
-
-        // HTTP/2 keep-alive settings
-        if config.grpc.http2_keep_alive {
-            if let Some(interval) = config.grpc.http2_keep_alive_interval {
-                builder = builder.http2_keep_alive_interval(interval);
-            }
-
-            if let Some(timeout) = config.grpc.http2_keep_alive_timeout {
-                builder = builder.keep_alive_timeout(timeout);
-            }
-
-            if let Some(while_idle) = config.grpc.http2_keep_alive_while_idle {
-                builder = builder.keep_alive_while_idle(while_idle);
-            }
-        }
-
-        if let Some(max_size) = config.grpc.max_decoding_message_size {
-            builder = builder.max_decoding_message_size(max_size)
-        }
-
-        if let Some(window_size) = config.grpc.initial_connection_window_size {
-            builder = builder.initial_connection_window_size(window_size);
-        }
-
-        if let Some(stream_window_size) = config.grpc.initial_stream_window_size {
-            builder = builder.initial_stream_window_size(stream_window_size);
-        }
-
-        // Apply authentication token if provided
-        let builder = if let Some(ref token) = config.grpc.x_token {
-            builder
-                .x_token(Some(token.clone()))
-                .map_err(|e| StoreError::GrpcClientError(format!("Failed to set x-token: {}", e)))?
-        } else {
-            builder
-        };
-
-        let mut client = builder.connect().await.map_err(|e| {
-            StoreError::GrpcConnectionError(format!("Failed to connect to gRPC server: {}", e))
-        })?;
-
-        log::info!("Connected to gRPC endpoint: {}", config.grpc.endpoint);
-
-        let mut subscribed = cache.addresses();
-
-        let (mut sink, mut stream) = client
-            .subscribe_with_request(Some(subscribe_request(&subscribed)))
-            .await
-            .map_err(|e| {
-                StoreError::GrpcSubscriptionError(format!(
-                    "Failed to subscribe to gRPC stream: {}",
-                    e
-                ))
-            })?;
+        // The first subscription fails fast, so a bad endpoint or token is reported to the caller.
+        // Later disconnects are retried in the background.
+        let subscribed = cache.addresses();
+        let (sink, stream) = subscribe(&config.grpc, &subscribed).await?;
 
         log::info!("Subscribed to Shield program account updates");
 
-        // Spawn task to process account updates
-        let cache_clone = Arc::clone(&cache);
-        let snapshot_clone = Arc::clone(&snapshot);
-        let resync_interval = config.rpc.resync_interval;
-
-        tokio::spawn(async move {
-            let mut resync = tokio::time::interval_at(
-                tokio::time::Instant::now() + resync_interval,
-                resync_interval,
-            );
-            resync.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-            loop {
-                let changed = tokio::select! {
-                    message = stream.next() => match message {
-                        Some(Ok(msg)) => match msg.update_oneof {
-                            Some(UpdateOneof::Account(account_update)) => {
-                                apply_account_update(&cache_clone, account_update)
-                            }
-                            _ => false,
-                        },
-                        Some(Err(e)) => {
-                            log::error!("Error receiving gRPC message: {}", e);
-                            break;
-                        }
-                        None => break,
-                    },
-                    _ = resync.tick() => match rpc.list(&PROGRAM_ID).await {
-                        Ok(policies) => {
-                            cache_clone.sync(policies);
-                            true
-                        }
-                        Err(e) => {
-                            log::warn!("Failed to resync policies over RPC: {}", e);
-                            false
-                        }
-                    },
-                };
-
-                if !changed {
-                    continue;
-                }
-
-                snapshot_clone.store(Arc::new(Snapshot::new(&cache_clone)));
-
-                // Closing a policy assigns it to the system program, so the owner filter never
-                // sees the close. Subscribing to the known addresses as well catches it.
-                let addresses = cache_clone.addresses();
-                if addresses != subscribed {
-                    if let Err(e) = sink.send(subscribe_request(&addresses)).await {
-                        log::error!("Failed to update gRPC subscription: {}", e);
-                        break;
-                    }
-                    subscribed = addresses;
-                }
-            }
-
-            log::warn!("gRPC stream ended");
-        });
+        tokio::spawn(process_updates(
+            config,
+            rpc,
+            cache,
+            Arc::downgrade(&snapshot),
+            Subscription {
+                sink,
+                stream,
+                addresses: subscribed,
+            },
+        ));
 
         Ok(PolicyStore::new(snapshot))
+    }
+}
+
+const MIN_RECONNECT_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_RECONNECT_BACKOFF: Duration = Duration::from_secs(30);
+
+struct Subscription {
+    sink: SubscribeRequestSink,
+    stream: GeyserStream,
+    /// Policy addresses included in the current subscription request.
+    addresses: HashSet<Pubkey>,
+}
+
+/// Connects to the gRPC endpoint and subscribes to the Shield program accounts and the given
+/// policy addresses.
+async fn subscribe(
+    config: &PolicyStoreGrpcConfig,
+    addresses: &HashSet<Pubkey>,
+) -> StoreResult<(SubscribeRequestSink, GeyserStream)> {
+    let mut builder = GeyserGrpcClient::build_from_shared(config.endpoint.clone())
+        .map_err(|e| StoreError::GrpcClientError(format!("Failed to build gRPC client: {}", e)))?
+        .connect_timeout(config.connect_timeout)
+        .timeout(config.timeout);
+
+    if config.tcp_nodelay {
+        builder = builder.tcp_nodelay(true);
+    }
+
+    if config.http2_adaptive_window {
+        builder = builder.http2_adaptive_window(true);
+    }
+
+    builder = builder
+        .tls_config(ClientTlsConfig::new().with_native_roots())
+        .map_err(|e| StoreError::GrpcClientError(format!("Failed to set TLS config: {}", e)))?;
+
+    // HTTP/2 keep-alive settings
+    if config.http2_keep_alive {
+        if let Some(interval) = config.http2_keep_alive_interval {
+            builder = builder.http2_keep_alive_interval(interval);
+        }
+
+        if let Some(timeout) = config.http2_keep_alive_timeout {
+            builder = builder.keep_alive_timeout(timeout);
+        }
+
+        if let Some(while_idle) = config.http2_keep_alive_while_idle {
+            builder = builder.keep_alive_while_idle(while_idle);
+        }
+    }
+
+    if let Some(max_size) = config.max_decoding_message_size {
+        builder = builder.max_decoding_message_size(max_size)
+    }
+
+    if let Some(window_size) = config.initial_connection_window_size {
+        builder = builder.initial_connection_window_size(window_size);
+    }
+
+    if let Some(stream_window_size) = config.initial_stream_window_size {
+        builder = builder.initial_stream_window_size(stream_window_size);
+    }
+
+    // Apply authentication token if provided
+    let builder = if let Some(ref token) = config.x_token {
+        builder
+            .x_token(Some(token.clone()))
+            .map_err(|e| StoreError::GrpcClientError(format!("Failed to set x-token: {}", e)))?
+    } else {
+        builder
+    };
+
+    let mut client = builder.connect().await.map_err(|e| {
+        StoreError::GrpcConnectionError(format!("Failed to connect to gRPC server: {}", e))
+    })?;
+
+    log::info!("Connected to gRPC endpoint: {}", config.endpoint);
+
+    client
+        .subscribe_with_request(Some(subscribe_request(addresses)))
+        .await
+        .map_err(|e| {
+            StoreError::GrpcSubscriptionError(format!("Failed to subscribe to gRPC stream: {}", e))
+        })
+}
+
+/// Rebuilds the snapshot from the cache.
+///
+/// # Returns
+///
+/// `false` if the [`PolicyStore`] was dropped and there is nobody left to update.
+fn publish(cache: &PolicyCache, snapshot: &Weak<ArcSwap<Snapshot>>) -> bool {
+    match snapshot.upgrade() {
+        Some(snapshot) => {
+            snapshot.store(Arc::new(Snapshot::new(cache)));
+            true
+        }
+        None => false,
+    }
+}
+
+/// Re-fetches all policies over RPC.
+///
+/// # Returns
+///
+/// `true` if the cache was updated.
+async fn resync(rpc: &PolicyRpcClient, cache: &PolicyCache) -> bool {
+    match rpc.list(&PROGRAM_ID).await {
+        Ok(policies) => {
+            cache.sync(policies);
+            true
+        }
+        Err(e) => {
+            log::warn!("Failed to resync policies over RPC: {}", e);
+            false
+        }
+    }
+}
+
+/// Applies gRPC updates and periodic RPC resyncs to the cache until the [`PolicyStore`] is
+/// dropped. Reconnects with exponential backoff when the stream ends or fails.
+async fn process_updates(
+    config: PolicyStoreConfig,
+    rpc: PolicyRpcClient,
+    cache: Arc<PolicyCache>,
+    snapshot: Weak<ArcSwap<Snapshot>>,
+    subscription: Subscription,
+) {
+    let mut resync_interval = tokio::time::interval_at(
+        tokio::time::Instant::now() + config.rpc.resync_interval,
+        config.rpc.resync_interval,
+    );
+    resync_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
+    let mut backoff = MIN_RECONNECT_BACKOFF;
+    let mut connected = Some(subscription);
+
+    loop {
+        let mut subscription = match connected.take() {
+            Some(subscription) => subscription,
+            None => {
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(MAX_RECONNECT_BACKOFF);
+
+                if snapshot.strong_count() == 0 {
+                    return;
+                }
+
+                // Updates may have been missed while disconnected.
+                if resync(&rpc, &cache).await && !publish(&cache, &snapshot) {
+                    return;
+                }
+
+                let addresses = cache.addresses();
+                match subscribe(&config.grpc, &addresses).await {
+                    Ok((sink, stream)) => {
+                        log::info!("Resubscribed to Shield program account updates");
+                        backoff = MIN_RECONNECT_BACKOFF;
+                        Subscription {
+                            sink,
+                            stream,
+                            addresses,
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to resubscribe, retrying in {:?}: {}", backoff, e);
+                        continue;
+                    }
+                }
+            }
+        };
+
+        loop {
+            let changed = tokio::select! {
+                message = subscription.stream.next() => match message {
+                    Some(Ok(msg)) => match msg.update_oneof {
+                        Some(UpdateOneof::Account(account_update)) => {
+                            apply_account_update(&cache, account_update)
+                        }
+                        _ => false,
+                    },
+                    Some(Err(e)) => {
+                        log::error!("Error receiving gRPC message: {}", e);
+                        break;
+                    }
+                    None => break,
+                },
+                _ = resync_interval.tick() => resync(&rpc, &cache).await,
+            };
+
+            if snapshot.strong_count() == 0 {
+                return;
+            }
+
+            if !changed {
+                continue;
+            }
+
+            if !publish(&cache, &snapshot) {
+                return;
+            }
+
+            // Closing a policy assigns it to the system program, so the owner filter never
+            // sees the close. Subscribing to the known addresses as well catches it.
+            let addresses = cache.addresses();
+            if addresses != subscription.addresses {
+                if let Err(e) = subscription.sink.send(subscribe_request(&addresses)).await {
+                    log::error!("Failed to update gRPC subscription: {}", e);
+                    break;
+                }
+                subscription.addresses = addresses;
+            }
+        }
+
+        log::warn!("gRPC stream ended, reconnecting in {:?}", backoff);
     }
 }
 
@@ -800,6 +900,7 @@ impl PolicyStore {
 mod tests {
     use super::*;
     use solana_pubkey::Pubkey;
+    use yellowstone_grpc_proto::{geyser::SubscribeUpdate, tonic};
     use yellowstone_shield_parser::accounts::Policy;
 
     #[test]
@@ -1074,6 +1175,142 @@ mod tests {
             vec![address.to_string()]
         );
         assert!(request.accounts[ADDRESS_FILTER].owner.is_empty());
+    }
+
+    fn test_config() -> PolicyStoreConfig {
+        toml::from_str(
+            r#"
+            [rpc]
+            endpoint = "http://127.0.0.1:1"
+            resync_interval = "1h"
+
+            [grpc]
+            endpoint = "http://127.0.0.1:1"
+            http2_keep_alive_interval = "30s"
+            http2_keep_alive_timeout = "10s"
+            "#,
+        )
+        .unwrap()
+    }
+
+    struct MockConnection {
+        updates: tokio::sync::mpsc::Sender<Result<SubscribeUpdate, tonic::Status>>,
+        requests: futures::channel::mpsc::Receiver<SubscribeRequest>,
+        subscription: Subscription,
+    }
+
+    fn mock_connection() -> MockConnection {
+        let (updates, updates_rx) = tokio::sync::mpsc::channel(16);
+        let (requests_tx, requests) = futures::channel::mpsc::channel(16);
+
+        MockConnection {
+            updates,
+            requests,
+            subscription: Subscription {
+                sink: SubscribeRequestSink::mock(requests_tx),
+                stream: GeyserStream::mock(updates_rx),
+                addresses: HashSet::new(),
+            },
+        }
+    }
+
+    fn rpc_mock() -> PolicyRpcClient {
+        PolicyRpcClient::new(RpcClient::new_mock("succeeds".to_string()))
+    }
+
+    fn account_message(update: SubscribeUpdateAccount) -> Result<SubscribeUpdate, tonic::Status> {
+        Ok(SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Account(update)),
+            ..Default::default()
+        })
+    }
+
+    fn ping_message() -> Result<SubscribeUpdate, tonic::Status> {
+        Ok(SubscribeUpdate {
+            update_oneof: Some(UpdateOneof::Ping(Default::default())),
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn test_process_updates_applies_updates_and_extends_subscription() {
+        let cache = Arc::new(PolicyCache::new());
+        let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::new(&cache)));
+        let MockConnection {
+            updates,
+            mut requests,
+            subscription,
+        } = mock_connection();
+
+        let task = tokio::spawn(process_updates(
+            test_config(),
+            rpc_mock(),
+            Arc::clone(&cache),
+            Arc::downgrade(&snapshot),
+            subscription,
+        ));
+
+        let address = Pubkey::new_unique();
+        let validator = Pubkey::new_unique();
+        updates
+            .send(account_message(account_update(
+                address,
+                PROGRAM_ID,
+                1,
+                1_000_000,
+                policy_v2_data(PermissionStrategy::Deny, &[validator]),
+            )))
+            .await
+            .unwrap();
+
+        let request = requests.next().await.unwrap();
+        assert_eq!(
+            request.accounts[ADDRESS_FILTER].account,
+            vec![address.to_string()]
+        );
+        assert_eq!(
+            snapshot.load().is_allowed(&[address], &validator),
+            Ok(false)
+        );
+
+        // The task stops once the store is dropped.
+        drop(snapshot);
+        updates.send(ping_message()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_process_updates_keeps_running_after_stream_ends() {
+        let cache = Arc::new(PolicyCache::new());
+        let snapshot = Arc::new(ArcSwap::from_pointee(Snapshot::new(&cache)));
+        let MockConnection {
+            updates,
+            requests: _requests,
+            subscription,
+        } = mock_connection();
+
+        let task = tokio::spawn(process_updates(
+            test_config(),
+            rpc_mock(),
+            Arc::clone(&cache),
+            Arc::downgrade(&snapshot),
+            subscription,
+        ));
+
+        // End the stream. Reconnecting fails because nothing listens on the endpoint, but the
+        // task keeps retrying instead of giving up.
+        drop(updates);
+        tokio::time::sleep(MAX_RECONNECT_BACKOFF * 4).await;
+        assert!(!task.is_finished());
+
+        drop(snapshot);
+        tokio::time::timeout(MAX_RECONNECT_BACKOFF * 2, task)
+            .await
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

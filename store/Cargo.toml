@@ -36,6 +36,8 @@ yellowstone-shield-parser = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 env_logger = { workspace = true }
 solana-cli-config = { workspace = true }
+tokio = { workspace = true, features = ["full", "test-util"] }
 toml = { workspace = true }
+yellowstone-grpc-client = { workspace = true, features = ["test-tools"] }
 yellowstone-shield-cli = { workspace = true }
 yellowstone-shield-client = { workspace = true }

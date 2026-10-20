@@ -14,6 +14,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Policy store: reconnect to gRPC with exponential backoff (1s up to 30s) when the stream ends or fails, and resync over RPC before resubscribing. Before, the store silently stopped receiving updates after the first disconnect. The background task now stops when the `PolicyStore` is dropped
 - Policy store: closed policies are now removed from the cache. The store also subscribes to the known policy addresses (closing a policy assigns it to the system program, so the owner filter never sees it) and re-fetches all policies over RPC every `rpc.resync_interval` (default 5m) (#24)
 - Policy store: return a `StoreError` instead of panicking when the gRPC TLS config can't be applied
 
