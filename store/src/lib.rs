@@ -532,7 +532,7 @@ impl PolicyStoreBuilder {
 
         builder = builder
             .tls_config(ClientTlsConfig::new().with_native_roots())
-            .expect("Failed to set TLS config");
+            .map_err(|e| StoreError::GrpcClientError(format!("Failed to set TLS config: {}", e)))?;
 
         // HTTP/2 keep-alive settings
         if config.grpc.http2_keep_alive {
