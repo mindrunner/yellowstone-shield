@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- Bump yellowstone-grpc-client to v15.0 and yellowstone-grpc-proto to v14.0
+
 ### Fixed
 
 - Policy store: return a `StoreError` instead of panicking when the gRPC TLS config can't be applied
